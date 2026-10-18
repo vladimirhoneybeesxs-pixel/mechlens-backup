@@ -238,6 +238,8 @@ Failure message names the missing set. (`INTENTIONAL_EXCLUDES` in the test handl
 | GQA / MQA (`n_key_value_heads < n_heads`) | `llama.py`, `mistral.py`, `falcon.py`, `cohere.py` | Set `cfg.n_key_value_heads`; pass `n_kv_heads=` to `_qkvo_weight_conversions()` |
 | RMSNorm with offset | `gemma1.py`, `gemma2.py`, `gemma3.py` | `cfg.rmsnorm_uses_offset = True` + `ArithmeticTensorConversion(ADDITION, 1.0)` |
 | Standard LayerNorm | `gpt2.py`, `bloom.py` | `cfg.normalization_type = "LN"` |
+| Interleaved RoPE (adjacent `(2i, 2i+1)` pairs, `repeat_interleave` cos/sin) | `cohere.py` | `cfg.rotary_adjacent_pairs = True` — `PositionEmbeddingsAttentionBridge` reimplements attention and otherwise rotates Llama-style, which silently diverges from HF at every position > 0 |
+| QK-norm (`q_norm` / `k_norm` inside attention) | `olmo2.py`, `qwen3.py`, `gemma3.py`, `cohere.py` | Declare `q_norm`/`k_norm` submodules whenever the HF module has them (the bridge raises at boot if you omit them). Use `RMSNormalizationBridge` for RMS norms, `NormalizationBridge` for true LayerNorm (Cohere). Phase is inferred from the weight shape: `(head_dim,)` post-reshape, `(n_heads*head_dim,)` pre-reshape, `(n_heads, head_dim)` pre-transpose. Gate the declaration on the config flag (`use_qk_norm`) when the family has both variants |
 | Gated MLP (`gate_proj`, `up_proj`, `down_proj`) | `llama.py`, `mistral.py`, `gemma1.py`, `qwen2.py`+ | `GatedMLPBridge` with submodules `{gate, in, out}` |
 | Combined QKV (`c_attn`) | `gpt2.py`, `bloom.py` | `QKVSplitRearrangeConversion` to split + rearrange |
 | Split Q/K/V (standard) | `llama.py`, `mistral.py`, most modern | `self._qkvo_weight_conversions()` helper |

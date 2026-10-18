@@ -30,6 +30,7 @@ def _make_cfg(
     n_key_value_heads: int | None = 2,
     logit_scale: float | None = 0.0625,
     rope_parameters: dict | None = None,
+    use_qk_norm: bool | None = None,
 ) -> TransformerBridgeConfig:
     """Minimal TransformerBridgeConfig for Cohere adapter tests."""
     cfg = TransformerBridgeConfig(
@@ -49,6 +50,8 @@ def _make_cfg(
     setattr(cfg, "logit_scale", logit_scale)
     if rope_parameters is not None:
         setattr(cfg, "rope_parameters", rope_parameters)
+    if use_qk_norm is not None:
+        setattr(cfg, "use_qk_norm", use_qk_norm)
     return cfg
 
 
@@ -68,6 +71,12 @@ class TestCohereAdapterConfig:
     def test_parallel_attn_mlp_is_true(self, adapter: CohereArchitectureAdapter) -> None:
         # Single input_layernorm; attn and MLP run in parallel on same normed input.
         assert adapter.cfg.parallel_attn_mlp is True
+
+    def test_rotary_adjacent_pairs_is_true(self, adapter: CohereArchitectureAdapter) -> None:
+        # Cohere RoPE is interleaved (repeat_interleave cos/sin, (2i, 2i+1) pairs);
+        # the attention bridge needs this flag or it rotates Llama-style and
+        # diverges from HF at every position > 0.
+        assert adapter.cfg.rotary_adjacent_pairs is True
 
     def test_default_prepend_bos_is_true(self, adapter: CohereArchitectureAdapter) -> None:
         assert adapter.cfg.default_prepend_bos is True
@@ -438,3 +447,79 @@ class TestCohereArchitectureGuards:
         assert adapter.cfg.uses_rms_norm is False
         assert adapter.cfg.normalization_type == "LN"
         assert adapter.cfg.final_rms is False
+
+
+class TestCohereQKNorm:
+    """use_qk_norm (Command R+): q_norm/k_norm declared iff the HF config enables them.
+
+    PositionEmbeddingsAttentionBridge reimplements attention (no HF delegation) and
+    raises at boot when the HF module has q_norm/k_norm that the adapter did not
+    declare, so a missing declaration makes every use_qk_norm=True checkpoint
+    unbootable. Conversely, declaring them on a model without them fails path
+    resolution. The declaration must therefore track cfg.use_qk_norm exactly.
+    """
+
+    def _attn(self, adapter: CohereArchitectureAdapter) -> PositionEmbeddingsAttentionBridge:
+        attn = adapter.get_generalized_component("blocks.0.attn")
+        assert isinstance(attn, PositionEmbeddingsAttentionBridge)
+        return attn
+
+    def test_default_cfg_has_no_qk_norm(self, adapter: CohereArchitectureAdapter) -> None:
+        # Command-R / Aya base models: use_qk_norm=False (attr absent from HF config
+        # passthrough when False is the default is still handled as False).
+        assert adapter.cfg.use_qk_norm is False  # type: ignore[attr-defined]
+        attn = self._attn(adapter)
+        assert "q_norm" not in attn.submodules
+        assert "k_norm" not in attn.submodules
+
+    def test_use_qk_norm_false_explicit(self) -> None:
+        adapter = CohereArchitectureAdapter(_make_cfg(use_qk_norm=False))
+        attn = self._attn(adapter)
+        assert "q_norm" not in attn.submodules
+        assert "k_norm" not in attn.submodules
+
+    def test_use_qk_norm_true_declares_both_norms(self) -> None:
+        adapter = CohereArchitectureAdapter(_make_cfg(use_qk_norm=True))
+        assert adapter.cfg.use_qk_norm is True  # type: ignore[attr-defined]
+        attn = self._attn(adapter)
+        assert "q_norm" in attn.submodules
+        assert "k_norm" in attn.submodules
+        assert attn.submodules["q_norm"].name == "q_norm"
+        assert attn.submodules["k_norm"].name == "k_norm"
+
+    def test_qk_norms_are_true_layernorm_not_rms(self) -> None:
+        # CohereLayerNorm subtracts the mean; RMSNormalizationBridge would be wrong.
+        from transformer_lens.model_bridge.generalized_components import (
+            RMSNormalizationBridge,
+        )
+
+        adapter = CohereArchitectureAdapter(_make_cfg(use_qk_norm=True))
+        attn = self._attn(adapter)
+        for key in ("q_norm", "k_norm"):
+            norm = attn.submodules[key]
+            assert isinstance(norm, NormalizationBridge)
+            assert not isinstance(norm, RMSNormalizationBridge)
+            assert norm.uses_rms_norm is False
+
+    def test_qk_norm_hooks_registered(self) -> None:
+        adapter = CohereArchitectureAdapter(_make_cfg(use_qk_norm=True))
+        attn = self._attn(adapter)
+        assert hasattr(attn, "hook_q_normed")
+        assert hasattr(attn, "hook_k_normed")
+
+    def test_qk_norm_does_not_change_weight_conversions(self) -> None:
+        # Cohere QK norm has no offset / reshaping; q_norm.weight must pass through
+        # untouched (unlike Gemma-3, which needs a +1 offset conversion).
+        adapter = CohereArchitectureAdapter(_make_cfg(use_qk_norm=True))
+        assert adapter.weight_processing_conversions is not None
+        assert not any(
+            "q_norm" in k or "k_norm" in k for k in adapter.weight_processing_conversions
+        )
+
+    def test_qk_norm_does_not_alter_other_components(self) -> None:
+        base = CohereArchitectureAdapter(_make_cfg(use_qk_norm=False))
+        qk = CohereArchitectureAdapter(_make_cfg(use_qk_norm=True))
+        assert set(base.component_mapping.keys()) == set(qk.component_mapping.keys())
+        base_attn, qk_attn = self._attn(base), self._attn(qk)
+        for key in ("q", "k", "v", "o"):
+            assert qk_attn.submodules[key].name == base_attn.submodules[key].name

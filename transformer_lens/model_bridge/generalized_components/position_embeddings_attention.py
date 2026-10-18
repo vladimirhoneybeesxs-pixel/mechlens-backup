@@ -174,7 +174,8 @@ class PositionEmbeddingsAttentionBridge(PositionEmbeddingHooksMixin, AttentionBr
                     f"'{norm_name}' but adapter did not declare it. Forward would "
                     f"skip the norm, producing wrong logits vs HF. Add "
                     f"'{norm_name}': RMSNormalizationBridge(name='{norm_name}', "
-                    f"config=self.cfg) to the attention submodules."
+                    f"config=self.cfg) (or NormalizationBridge for a true "
+                    f"LayerNorm such as CohereLayerNorm) to the attention submodules."
                 )
 
     def _decide_qk_norm_phase(self, hf_attn: torch.nn.Module) -> Optional[str]:
@@ -204,9 +205,12 @@ class PositionEmbeddingsAttentionBridge(PositionEmbeddingHooksMixin, AttentionBr
             return "post_reshape"
         if n_heads and shape == (n_heads * head_dim,):
             return "pre_reshape"
-        # Per-head norm (Cohere) broadcasts on the reshaped [B,H,S,D] tensor.
+        # Per-head norm (Cohere): HF applies CohereLayerNorm with a
+        # (n_heads, head_dim) weight on the [B, S, H, D] view BEFORE the
+        # transpose, so the weight aligns with the trailing (H, D) dims.
+        # Applying it on [B, H, S, D] would broadcast against (S, D) instead.
         if n_heads and shape == (n_heads, head_dim):
-            return "post_reshape"
+            return "pre_transpose"
         raise RuntimeError(
             f"{self.name}: cannot determine QK-norm phase from q_norm weight "
             f"shape {shape} (head_dim={head_dim}, n_heads={n_heads}). Expected "
@@ -233,6 +237,51 @@ class PositionEmbeddingsAttentionBridge(PositionEmbeddingHooksMixin, AttentionBr
             normed = hook(norm_module(flat))
             return normed.view(b, s, h, d)
         return hook(norm_module(tensor))
+
+    @staticmethod
+    def _rotate_half_adjacent_pairs(x: torch.Tensor) -> torch.Tensor:
+        """Interleaved rotate-half: pairs (x[2i], x[2i+1]) -> (-x[2i+1], x[2i]).
+
+        This is the GPT-J / GPT-NeoX / Cohere convention (``rotary_adjacent_pairs``
+        in HookedTransformer), as opposed to Llama's half-split ``rotate_half``.
+        """
+        x1 = x[..., ::2]
+        x2 = x[..., 1::2]
+        return torch.stack((-x2, x1), dim=-1).flatten(-2)
+
+    def _apply_rotary_pos_emb(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply RoPE to [B, H, S, D] q/k, honouring the model's pairing convention.
+
+        ``cfg.rotary_adjacent_pairs=False`` (default, Llama & most models): HF's
+        rotary module emits ``cat(freqs, freqs)`` cos/sin and pairs dim ``i`` with
+        ``i + D/2``; Llama's ``apply_rotary_pos_emb`` is exact.
+
+        ``cfg.rotary_adjacent_pairs=True`` (Cohere / Command-R, GPT-J, NeoX): the
+        rotary module emits ``repeat_interleave(freqs, 2)`` cos/sin and pairs dim
+        ``2i`` with ``2i+1``. Using Llama's half-split rotation against interleaved
+        cos/sin is not a rotation at all and silently diverges from HF at every
+        position > 0, so the interleaved rotation is applied here instead. Matching
+        HF Cohere, the rotation runs in float32 and casts back.
+        """
+        if not bool(getattr(self.config, "rotary_adjacent_pairs", False)):
+            from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
+
+            return apply_rotary_pos_emb(q, k, cos, sin)
+
+        dtype = q.dtype
+        q32, k32 = q.float(), k.float()
+        cos32 = cos.float().unsqueeze(1)
+        sin32 = sin.float().unsqueeze(1)
+        rot = self._rotate_half_adjacent_pairs
+        q_embed = (q32 * cos32) + (rot(q32) * sin32)
+        k_embed = (k32 * cos32) + (rot(k32) * sin32)
+        return q_embed.to(dtype=dtype), k_embed.to(dtype=dtype)
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
         """Reimplemented forward pass with hooks at correct computation stages.
@@ -365,16 +414,24 @@ class PositionEmbeddingsAttentionBridge(PositionEmbeddingHooksMixin, AttentionBr
 
         # For the split path, tensors are already [B, S, H, d_head]; for the
         # default path they're flat [B, S, H*d_head] and need the view.
-        if split_active:
-            query_states = query_states.transpose(1, 2)
-            key_states = key_states.transpose(1, 2)
-            value_states = value_states.transpose(1, 2)
-        else:
-            query_states = query_states.view(hidden_shape).transpose(1, 2)
-            key_states = key_states.view(hidden_shape).transpose(1, 2)
-            value_states = value_states.view(hidden_shape).transpose(1, 2)
+        if not split_active:
+            query_states = query_states.view(hidden_shape)
+            key_states = key_states.view(hidden_shape)
+            value_states = value_states.view(hidden_shape)
 
-        # Post-reshape phase (Gemma-3/Cohere): norm on [B, H, S, D].
+        # Pre-transpose phase (Cohere): per-head LayerNorm with a
+        # (n_heads, head_dim) weight on [B, S, H, D], matching HF's
+        # project -> view -> norm -> transpose order.
+        if has_q_norm and self._qk_norm_phase == "pre_transpose":
+            query_states = self.hook_q_normed(self.q_norm(query_states))
+            if has_k_norm:
+                key_states = self.hook_k_normed(self.k_norm(key_states))
+
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
+
+        # Post-reshape phase (Gemma-3): norm over head_dim on [B, H, S, D].
         if has_q_norm and self._qk_norm_phase == "post_reshape":
             query_states = self.hook_q_normed(self.q_norm(query_states))
             if has_k_norm:
@@ -384,19 +441,22 @@ class PositionEmbeddingsAttentionBridge(PositionEmbeddingHooksMixin, AttentionBr
         if position_embeddings is not None:
             position_embeddings = self._apply_position_embedding_hooks(position_embeddings)
             cos, sin = position_embeddings
-            from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
 
             # Some models use partial rotary (e.g., GPT-OSS) where cos/sin cover only
             # a portion of head_dim. Split Q/K, rotate the partial dims, recombine.
+            # _apply_rotary_pos_emb picks the half-split (Llama) or adjacent-pairs
+            # (Cohere) pairing from cfg.rotary_adjacent_pairs.
             rotary_dim = cos.shape[-1]
             if rotary_dim < head_dim:
                 q_rot, q_pass = query_states[..., :rotary_dim], query_states[..., rotary_dim:]
                 k_rot, k_pass = key_states[..., :rotary_dim], key_states[..., rotary_dim:]
-                q_rot, k_rot = apply_rotary_pos_emb(q_rot, k_rot, cos, sin)
+                q_rot, k_rot = self._apply_rotary_pos_emb(q_rot, k_rot, cos, sin)
                 query_states = torch.cat([q_rot, q_pass], dim=-1)
                 key_states = torch.cat([k_rot, k_pass], dim=-1)
             else:
-                query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+                query_states, key_states = self._apply_rotary_pos_emb(
+                    query_states, key_states, cos, sin
+                )
 
         # Fire hook_rot_q/hook_rot_k (post-rotation)
         if hasattr(self, "hook_rot_q"):

@@ -49,6 +49,7 @@ _HF_PASSTHROUGH_ATTRS = [
     # Cohere
     "logit_scale",
     "rope_parameters",
+    "use_qk_norm",
     # Hybrid/MoE architectures
     "layer_types",
     "moe_intermediate_size",

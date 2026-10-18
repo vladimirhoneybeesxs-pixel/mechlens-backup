@@ -7,7 +7,11 @@ Supports CohereForCausalLM models (Command-R family) with:
 - Gated SwiGLU MLP (gate_proj, up_proj, down_proj)
 - Logit scaling: output logits multiplied by config.logit_scale (default 1/16)
 - Tied embed/unembed weights by default (tie_word_embeddings=True)
-- Interleaved RoPE via CohereRotaryEmbedding (delegated to HF module)
+- Interleaved (adjacent-pairs) RoPE: cos/sin come from CohereRotaryEmbedding
+  (delegated); the rotation itself uses cfg.rotary_adjacent_pairs=True
+- Optional per-head QK LayerNorm (config.use_qk_norm, e.g. Command R+):
+  CohereLayerNorm with weight shape (n_heads, d_head) / (n_kv_heads, d_head),
+  applied to the [batch, pos, head, d_head] view BEFORE the head transpose
 """
 
 from typing import Any
@@ -37,13 +41,24 @@ class CohereArchitectureAdapter(ArchitectureAdapter):
       It has a weight parameter but NO bias parameter.
     - Logit scale: CohereForCausalLM.forward multiplies logits by logit_scale
       (default 0.0625 = 1/16). Folded into unembed.weight via preprocess_weights.
-    - Rotary embeddings use repeat_interleave instead of cat-split (delegated to HF).
+    - Rotary embeddings use repeat_interleave instead of cat-split. cos/sin are
+      delegated to CohereRotaryEmbedding; cfg.rotary_adjacent_pairs=True makes the
+      attention bridge pair dims (2i, 2i+1) instead of (i, i + d_head/2).
+    - QK-norm (use_qk_norm=True; Command R+ family): CohereAttention owns
+      q_norm/k_norm CohereLayerNorm modules whose weights are per-head
+      (n_heads, d_head). PositionEmbeddingsAttentionBridge reimplements the
+      attention forward rather than delegating, and REQUIRES the adapter to
+      declare any QK norm the HF module has (it raises at boot otherwise), so
+      q_norm/k_norm are declared here whenever cfg.use_qk_norm is set. The
+      bridge detects the (n_heads, d_head) weight shape and applies the norm
+      on the pre-transpose [B, S, H, D] view, matching HF.
 
     Optional parameters (absent from state_dict by default):
     - blocks.{i}.attn.b_Q/b_K/b_V/b_O — no bias on projections (attention_bias=False)
     - blocks.{i}.mlp.b_gate/b_in/b_out  — no bias on MLP projections
     - blocks.{i}.ln1.b                   — CohereLayerNorm has no bias
     - ln_final.b                         — CohereLayerNorm has no bias
+    - blocks.{i}.attn.q_norm.w / k_norm.w — only present when use_qk_norm=True
     """
 
     def __init__(self, cfg: Any) -> None:
@@ -59,6 +74,16 @@ class CohereArchitectureAdapter(ArchitectureAdapter):
 
         # --- Position embeddings and MLP ---
         self.cfg.positional_embedding_type = "rotary"
+        # Cohere RoPE pairs ADJACENT dims (2i, 2i+1) with cos/sin built by
+        # repeat_interleave(freqs, 2) — the GPT-J/NeoX convention, not Llama's
+        # half-split. CohereRotaryEmbedding (delegated) produces the interleaved
+        # cos/sin; PositionEmbeddingsAttentionBridge reimplements the attention
+        # forward and reads this flag to apply the matching interleaved rotation.
+        # Without it the bridge rotates with Llama's rotate_half against
+        # interleaved cos/sin and diverges from HF at every position > 0
+        # (this is the P1 forward_pass_logits failure recorded for
+        # hyper-accel/tiny-random-cohere in the registry).
+        self.cfg.rotary_adjacent_pairs = True
         self.cfg.gated_mlp = True
         self.cfg.attn_only = False
 
@@ -105,12 +130,37 @@ class CohereArchitectureAdapter(ArchitectureAdapter):
             _theta = getattr(cfg, "default_theta", 10000.0)
         self.cfg.rotary_base = int(_theta)
 
+        # --- QK-norm (use_qk_norm) ---
+        # use_qk_norm is not a declared TransformerBridgeConfig field; it reaches
+        # us via _HF_PASSTHROUGH_ATTRS (sources/transformers.py + _bridge_builder.py).
+        # Only declare the norms when the HF module actually has them: the attention
+        # bridge raises if HF has q_norm/k_norm and we omit them, and resolving a
+        # declared "self_attn.q_norm" path fails when the module lacks them.
+        use_qk_norm = bool(getattr(cfg, "use_qk_norm", False))
+        self.cfg.use_qk_norm = use_qk_norm  # type: ignore[attr-defined]
+        attn_submodules: dict[str, Any] = {
+            "q": LinearBridge(name="q_proj"),
+            "k": LinearBridge(name="k_proj"),
+            "v": LinearBridge(name="v_proj"),
+            "o": LinearBridge(name="o_proj"),
+        }
+        if use_qk_norm:
+            # CohereLayerNorm is a true (mean-subtracting) LayerNorm, so this is
+            # NormalizationBridge, NOT RMSNormalizationBridge. uses_rms_norm=False
+            # is pinned explicitly so a future config change cannot flip it.
+            attn_submodules["q_norm"] = NormalizationBridge(
+                name="q_norm", config=self.cfg, uses_rms_norm=False
+            )
+            attn_submodules["k_norm"] = NormalizationBridge(
+                name="k_norm", config=self.cfg, uses_rms_norm=False
+            )
+
         # --- Component mapping ---
         # Block structure follows Falcon's parallel_attn=True, num_ln_in_parallel_attn=1
         # mode: single ln1 feeds both attn and MLP; NO ln2.
         # Submodule shapes follow Llama: separate q/k/v/o projections and SwiGLU MLP.
-        # Rotary and attention both delegate to HF modules, preserving Cohere's
-        # repeat_interleave RoPE convention without re-implementing it in TL.
+        # Rotary cos/sin delegate to CohereRotaryEmbedding; the attention bridge
+        # applies the interleaved rotation via cfg.rotary_adjacent_pairs.
         self.component_mapping = {
             # Embedding: model.embed_tokens (same root as Llama, not transformer.* like Falcon)
             "embed": EmbeddingBridge(name="model.embed_tokens"),
@@ -126,21 +176,15 @@ class CohereArchitectureAdapter(ArchitectureAdapter):
                     # before adding bias, so the missing bias attribute is silently skipped.
                     "ln1": NormalizationBridge(name="input_layernorm", config=self.cfg),
                     # No "ln2" — parallel block, same normed input goes to attn AND mlp.
+                    # q/k/v/o always; q_norm/k_norm only when cfg.use_qk_norm (see above).
                     "attn": PositionEmbeddingsAttentionBridge(
                         name="self_attn",
                         config=self.cfg,
-                        submodules={
-                            "q": LinearBridge(name="q_proj"),
-                            "k": LinearBridge(name="k_proj"),
-                            "v": LinearBridge(name="v_proj"),
-                            "o": LinearBridge(name="o_proj"),
-                        },
+                        submodules=attn_submodules,
                         requires_attention_mask=True,
                         requires_position_embeddings=True,
                     ),
                     # GatedMLPBridge: gate/in/out matches Llama's gate_proj/up_proj/down_proj.
-                    # Optional use_qk_norm is handled transparently by HF's
-                    # CohereAttention.forward delegation (no extra submodules needed).
                     "mlp": GatedMLPBridge(
                         name="mlp",
                         config=self.cfg,
@@ -177,8 +221,8 @@ class CohereArchitectureAdapter(ArchitectureAdapter):
         """Set rotary embedding reference on attention bridges for component testing.
 
         CohereRotaryEmbedding lives at hf_model.model.rotary_emb. The bridge
-        delegates to it directly, preserving the repeat_interleave RoPE convention
-        without re-implementing it in TL.
+        delegates cos/sin generation to it (interleaved layout); the rotation is
+        applied by the attention bridge under cfg.rotary_adjacent_pairs=True.
 
         Pattern matches llama.py and qwen2.py.
         """
